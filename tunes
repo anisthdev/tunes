@@ -1,0 +1,599 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["ytmusicapi", "mutagen"]
+# ///
+"""Music from YouTube Music into mpd's library, tagged from YouTube Music.
+
+  tunes search --json QUERY          albums, then songs, as JSON
+  tunes tracks --json ALBUM_ID       an album and its tracks
+  tunes get ALBUM_ID [--tracks 1,3]  download an album (or some of it)
+  tunes get --song VIDEO_ID          download one song, filed with its album
+  tunes import [--apply] [FILE...]   tag loose files (by default the ones at
+                                     the top of the music folder) from YouTube
+                                     Music and file them; without --apply, only
+                                     says what it would do
+
+get hands the download to quickbar's runner (scripts/download), so the bar
+shows it: `tunes fetch DIR` downloads the tracks with yt-dlp into a staging
+folder, keeping YouTube's audio as it is, then `tunes file DIR` tags them,
+moves them to <music>/<Album artist>/<Album> (<Year>)/NN Title.ext with a
+cover.jpg, updates mpd and notifies, with Play and Open folder.
+"""
+
+import base64
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+HOME = Path.home()
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "tunes"
+STAGING = CACHE / "staging"
+RUNNER = Path(os.environ.get("QUICKBAR_DOWNLOAD", HOME / "Projects/quickbar/scripts/download"))
+AUDIO = (".opus", ".m4a", ".webm", ".ogg", ".mp3", ".flac")
+COVER_SIZE = 1200
+
+
+def log(message):
+    print(message, file=sys.stderr, flush=True)
+
+
+def music_dir():
+    """mpd's music_directory, or ~/Music."""
+    conf = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "mpd" / "mpd.conf"
+    try:
+        for line in conf.read_text().splitlines():
+            match = re.match(r'\s*music_directory\s+"([^"]+)"', line)
+            if match:
+                return Path(match[1]).expanduser()
+    except OSError:
+        pass
+    return HOME / "Music"
+
+
+def yt():
+    from ytmusicapi import YTMusic
+
+    return YTMusic()
+
+
+def names(artists):
+    return ", ".join(a["name"] for a in artists or [] if a.get("name"))
+
+
+def cover_url(thumbnails, size):
+    """The largest thumbnail, asked for at size × size."""
+    if not thumbnails:
+        return ""
+    url = max(thumbnails, key=lambda t: t.get("width", 0))["url"]
+    return re.sub(r"=w\d+-h\d+", f"=w{size}-h{size}", url)
+
+
+def clean(name):
+    """A file or folder name: no slashes, control characters or trailing dots."""
+    name = re.sub(r'[/\\\x00-\x1f]', "-", name).strip()
+    return name.rstrip(". ") or "Unknown"
+
+
+def normalize(text):
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+# --- search ---------------------------------------------------------------------
+
+
+def search(query):
+    api = yt()
+    with ThreadPoolExecutor(2) as pool:
+        albums = pool.submit(api.search, query, filter="albums", limit=10)
+        songs = pool.submit(api.search, query, filter="songs", limit=15)
+        albums, songs = albums.result(), songs.result()
+    results = []
+    for a in albums:
+        if not a.get("browseId"):
+            continue
+        results.append({
+            "type": "album",
+            "id": a["browseId"],
+            "title": a.get("title") or "Untitled",
+            "artist": names(a.get("artists")),
+            "year": a.get("year") or "",
+            "kind": a.get("type") or "Album",
+            "cover": cover_url(a.get("thumbnails"), 120),
+        })
+    for s in songs:
+        if not s.get("videoId"):
+            continue
+        album = s.get("album") or {}
+        results.append({
+            "type": "song",
+            "id": s["videoId"],
+            "title": s.get("title") or "Untitled",
+            "artist": names(s.get("artists")),
+            "album": album.get("name") or "",
+            "album_id": album.get("id") or "",
+            "duration": s.get("duration") or "",
+            "cover": cover_url(s.get("thumbnails"), 120),
+        })
+    return results
+
+
+def album_plan(album_id, api=None):
+    """An album as get downloads it: its details and every track."""
+    api = api or yt()
+    a = api.get_album(album_id)
+    artists = a.get("artists") or []
+    tracks = a.get("tracks") or []
+    return {
+        "album": {
+            "id": album_id,
+            "title": a.get("title") or "Untitled",
+            "artist": names(artists),
+            "folder_artist": artists[0]["name"] if artists else names(tracks[0].get("artists")) if tracks else "Unknown",
+            "year": a.get("year") or "",
+            "kind": a.get("type") or "Album",
+            "cover": cover_url(a.get("thumbnails"), COVER_SIZE),
+            "thumb": cover_url(a.get("thumbnails"), 226),
+        },
+        "tracks": [
+            {
+                "n": t.get("trackNumber") or i + 1,
+                "total": len(tracks),
+                "title": t.get("title") or "Untitled",
+                "artist": names(t.get("artists")) or names(artists),
+                "videoId": t.get("videoId"),
+                "duration": t.get("duration") or "",
+                "seconds": t.get("duration_seconds") or 0,
+                "available": bool(t.get("videoId")) and t.get("isAvailable", True),
+            }
+            for i, t in enumerate(tracks)
+        ],
+    }
+
+
+def album_track(plan, video_id, title):
+    """The album's track that is this song, as a list of it or nothing. The
+    album often lists the song under another video, so by title failing that."""
+    for t in plan["tracks"]:
+        if t["videoId"] == video_id:
+            return [t]
+    same = [t for t in plan["tracks"] if normalize(t["title"]) == normalize(title)]
+    return same[:1]
+
+
+def song_plan(video_id, album_id="", api=None):
+    """One song: the track of its album it is, or a single when it has none."""
+    api = api or yt()
+    if not album_id:
+        watch = api.get_watch_playlist(video_id, limit=1)
+        first = (watch.get("tracks") or [{}])[0]
+        album_id = (first.get("album") or {}).get("id") or ""
+    if album_id:
+        plan = album_plan(album_id, api)
+        picked = album_track(plan, video_id, api.get_song(video_id)["videoDetails"].get("title"))
+        if picked:
+            plan["tracks"] = picked
+            return plan
+    details = api.get_song(video_id)["videoDetails"]
+    artist = details.get("author") or "Unknown"
+    return {
+        "album": {"id": "", "title": "", "artist": artist, "folder_artist": artist, "year": "", "kind": "Single",
+                  "cover": cover_url(details.get("thumbnail", {}).get("thumbnails"), COVER_SIZE), "thumb": ""},
+        "tracks": [{"n": 1, "total": 1, "title": details.get("title") or "Untitled", "artist": artist,
+                    "videoId": video_id, "duration": "", "seconds": int(details.get("lengthSeconds") or 0),
+                    "available": True}],
+    }
+
+
+# --- get: hand a download to quickbar's runner -----------------------------------
+
+
+def get(plan, numbers=None):
+    if numbers:
+        plan["tracks"] = [t for t in plan["tracks"] if t["n"] in numbers]
+    plan["tracks"] = [t for t in plan["tracks"] if t["available"]]
+    if not plan["tracks"]:
+        sys.exit("Nothing to download: no such tracks, or none available")
+    album = plan["album"]
+    key = album["id"] or plan["tracks"][0]["videoId"]
+    folder = STAGING / f"{key}-{time.strftime('%Y%m%d%H%M%S')}"
+    folder.mkdir(parents=True)
+    (folder / "plan.json").write_text(json.dumps(plan, indent=1))
+
+    me = os.path.realpath(__file__)
+    count = len(plan["tracks"])
+    title = album["title"] or plan["tracks"][0]["title"]
+    if album["title"] and count < plan["tracks"][0]["total"]:
+        title += f" ({count} of {plan['tracks'][0]['total']})"
+    subprocess.run([
+        str(RUNNER), "start", "--kind", "music", "--title", title, "--subtitle", album["artist"],
+        "--total", str(count), "--scratch", str(folder),
+        "--done", f"{shlex.quote(me)} file {shlex.quote(str(folder))}",
+        "--", me, "fetch", str(folder),
+    ], check=True, stdout=subprocess.DEVNULL)
+
+
+def fetch(folder):
+    """Every track of the plan into folder, as YouTube has it, and the cover;
+    what's already there is kept, so it carries on after a pause."""
+    plan = json.loads((folder / "plan.json").read_text())
+    cover = plan["album"]["cover"]
+    if cover and not (folder / "cover.jpg").exists():
+        subprocess.run(["curl", "-fsSL", "--max-time", "60", "-o", str(folder / "cover.jpg"), cover])
+    tracks = plan["tracks"]
+    for i, t in enumerate(tracks, 1):
+        print(f"@item {i}/{len(tracks)} {t['title']}", flush=True)
+        if downloaded(folder, t["videoId"]):
+            continue
+        error = run_ytdlp(folder, t["videoId"])
+        if error is not None:
+            print(f"@error {t['title']}: {error}", flush=True)
+            sys.exit(1)
+        print("@progress 100%", flush=True)
+
+
+def downloaded(folder, video_id):
+    return next((p for p in folder.glob(f"{glob_escape(video_id)}.*") if p.suffix in AUDIO), None)
+
+
+def glob_escape(text):
+    return re.sub(r"([*?\[])", r"[\1]", text)
+
+
+def run_ytdlp(folder, video_id):
+    """None once it's downloaded, or yt-dlp's error."""
+    proc = subprocess.Popen(
+        ["yt-dlp", "-x", "-f", "bestaudio", "--newline", "--no-playlist", "--no-warnings",
+         "--progress", "--progress-template",
+         "download:@progress %(progress._percent_str)s @rate %(progress.speed)s @eta %(progress.eta)s",
+         "-o", str(folder / "%(id)s.%(ext)s"), "--", f"https://music.youtube.com/watch?v={video_id}"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+        # yt-dlp's progress as it comes, not when a pipe's buffer fills
+        env=dict(os.environ, PYTHONUNBUFFERED="1"),
+    )
+    error = ""
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+        if line.startswith("ERROR:"):
+            error = line[6:].strip()
+    return None if proc.wait() == 0 else error or f"yt-dlp exited with {proc.returncode}"
+
+
+# --- tagging and filing -------------------------------------------------------------
+
+
+def tag(path, album, track, cover):
+    """Tags (and the cover) from the plan, whatever the format."""
+    import mutagen
+    from mutagen.flac import Picture
+    from mutagen.id3 import APIC, ID3, TALB, TDRC, TIT2, TPE1, TPE2, TRCK, TXXX
+    from mutagen.mp4 import MP4, MP4Cover
+
+    title, artist = track["title"], track["artist"]
+    album_title = album["title"] or title
+    album_artist = album["artist"] or artist
+    number, total = track["n"], track["total"]
+    year = str(album["year"] or "")
+    video_id = track["videoId"]
+
+    if path.suffix == ".m4a":
+        f = MP4(path)
+        f["\xa9nam"], f["\xa9ART"], f["\xa9alb"], f["aART"] = title, artist, album_title, album_artist
+        f["trkn"] = [(number, total)]
+        if year:
+            f["\xa9day"] = year
+        f["----:com.apple.iTunes:YTMUSIC_VIDEO_ID"] = video_id.encode()
+        if cover:
+            f["covr"] = [MP4Cover(cover, MP4Cover.FORMAT_JPEG)]
+        f.save()
+    elif path.suffix == ".mp3":
+        try:
+            f = ID3(path)
+        except mutagen.MutagenError:
+            f = ID3()
+        f.delall("APIC")
+        for frame in (TIT2(encoding=3, text=title), TPE1(encoding=3, text=artist), TALB(encoding=3, text=album_title),
+                      TPE2(encoding=3, text=album_artist), TRCK(encoding=3, text=f"{number}/{total}"),
+                      TXXX(encoding=3, desc="YTMUSIC_VIDEO_ID", text=video_id)):
+            f.add(frame)
+        if year:
+            f.add(TDRC(encoding=3, text=year))
+        if cover:
+            f.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=cover))
+        f.save(path)
+    else:
+        # Vorbis comments: opus, ogg, flac
+        f = mutagen.File(path)
+        if f is None:
+            raise ValueError(f"Can't tag {path.name}")
+        if f.tags is None:
+            f.add_tags()
+        f.tags.update({
+            "title": title, "artist": artist, "album": album_title, "albumartist": album_artist,
+            "tracknumber": str(number), "tracktotal": str(total), "ytmusic_video_id": video_id,
+        })
+        if year:
+            f.tags["date"] = year
+        if cover:
+            picture = Picture()
+            picture.type, picture.mime, picture.data = 3, "image/jpeg", cover
+            if path.suffix == ".flac":
+                f.clear_pictures()
+                f.add_picture(picture)
+            else:
+                f.tags["metadata_block_picture"] = base64.b64encode(picture.write()).decode()
+        f.save()
+
+
+def destination(music, album, track, suffix):
+    artist = clean(album["folder_artist"] or track["artist"])
+    if not album["title"]:
+        return music / artist / "Singles" / f"{clean(track['title'])}{suffix}"
+    name = clean(album["title"]) + (f" ({album['year']})" if album["year"] else "")
+    width = max(2, len(str(track["total"])))
+    return music / artist / name / f"{track['n']:0{width}d} {clean(track['title'])}{suffix}"
+
+
+def place(path, album, track, cover, music, replace=True):
+    """Tag a file and move it into the library; where it went. A file already
+    there is replaced (the same track downloaded again), or with replace off
+    kept, this one numbered beside it."""
+    tag(path, album, track, cover)
+    target = destination(music, album, track, path.suffix)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    n = 2
+    while not replace and target.exists():
+        target = target.with_name(f"{destination(music, album, track, '').name} ({n}){path.suffix}")
+        n += 1
+    shutil.move(str(path), target)
+    if cover and album["title"] and not (target.parent / "cover.jpg").exists():
+        (target.parent / "cover.jpg").write_bytes(cover)
+    return target
+
+
+def file(folder):
+    """The staged tracks tagged and moved into the library, then mpd updated."""
+    plan = json.loads((folder / "plan.json").read_text())
+    album = plan["album"]
+    cover_file = folder / "cover.jpg"
+    cover = cover_file.read_bytes() if cover_file.exists() else None
+    music = music_dir()
+    print("@status Tagging", flush=True)
+    placed = []
+    for track in plan["tracks"]:
+        path = downloaded(folder, track["videoId"])
+        if path is None:
+            print(f"@error Missing: {track['title']}", flush=True)
+            sys.exit(1)
+        placed.append(place(path, album, track, cover, music))
+    shutil.rmtree(folder, ignore_errors=True)
+
+    print("@status Updating mpd", flush=True)
+    folder_in_library = placed[0].parent.relative_to(music)
+    subprocess.run(["mpc", "-q", "update", "--wait", str(folder_in_library)], capture_output=True)
+    added = [str(p.relative_to(music)) for p in placed]
+    title = album["title"] or plan["tracks"][0]["title"]
+    count = f"{len(placed)} tracks" if len(placed) > 1 else "1 track"
+    notify_added(f"Added: {title}", f"{album['artist']} · {count}", added, placed[0].parent)
+
+
+def notify_added(summary, body, files, folder):
+    """The done notification, with Play (mpd, from these tracks) and Open folder.
+
+    notify-send waits for the pick, so it runs on its own; this carries on and
+    exits meanwhile, which finishes the download in the bar.
+    """
+    script = """
+        summary=$1 body=$2 folder=$3; shift 3
+        case "$(notify-send --app-name=Music --icon=audio-x-generic \
+            --action=play=Play --action=open='Open folder' "$summary" "$body")" in
+        play) mpc -q clear && mpc -q add "$@" && mpc -q play ;;
+        open) exec uwsm app -- ghostty --title=yazi -e yazi "$folder" ;;
+        esac
+    """
+    subprocess.Popen(
+        ["sh", "-c", script, "sh", summary, body, str(folder), *files],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+# --- import: tag and file what's already there ----------------------------------------
+
+
+def probe(path):
+    """Artist, title and length of a loose file: from its name when that reads
+    "Artist - Title" (the tags of a YouTube rip are often the channel's), else
+    from its tags."""
+    import mutagen
+
+    artist = title = ""
+    seconds = 0
+    try:
+        f = mutagen.File(path, easy=True)
+        if f is not None:
+            artist = ", ".join(f.get("artist", []))
+            title = ", ".join(f.get("title", []))
+            seconds = int(f.info.length)
+    except mutagen.MutagenError:
+        pass
+    if " - " in path.stem:
+        artist, title = (part.strip() for part in path.stem.split(" - ", 1))
+    return artist, title or path.stem, seconds
+
+
+def similar(a, b):
+    from difflib import SequenceMatcher
+
+    return SequenceMatcher(None, a, b).ratio()
+
+
+def title_likeness(wanted, title):
+    """How alike two titles are, 0 to 1. YouTube Music's may have the original
+    script first ("紅蓮華 - Gurenge") or extras in brackets."""
+    title = title or ""
+    forms = {title, re.sub(r"[(\[].*?[)\]]", "", title), *title.split(" - ")}
+    best = 0.0
+    for form in map(normalize, forms):
+        if not form:
+            continue
+        score = similar(wanted, form)
+        if len(form) >= 4 and len(wanted) >= 4 and (form in wanted or wanted in form):
+            score = max(score, 0.85)
+        best = max(best, score)
+    return best
+
+
+# Words that make a recording another one: a remix, a cover, a version
+VARIANTS = {"remix", "jhankar", "cover", "lofi", "lo fi", "karaoke", "instrumental", "piano", "slowed", "reverb",
+            "acoustic", "live", "unplugged", "revival", "8d", "mashup", "version", "arrangement", "narration",
+            "trap", "chillwave", "tv size", "recreation", "recreations", "reprise"}
+
+
+def variant_words(text):
+    words = f" {normalize(text)} "
+    return {v for v in VARIANTS if f" {v} " in words}
+
+
+def best_match(results, artist, title, seconds):
+    """The search result that is this song, and whether it's sure: the title
+    alike and an artist shared. One sharing no artist is taken only when the
+    title is all but the same; the length counts for a little, as rips are
+    often cut differently."""
+    wanted = normalize(title)
+    def split(text):
+        return [normalize(a) for a in re.split(r",|&| and | x | feat\.? ", text) if a.strip()]
+
+    want_artists = split(artist)
+    best, best_score, best_sure = None, 0.0, False
+    for r in results:
+        if not r.get("videoId"):
+            continue
+        likeness = title_likeness(wanted, r.get("title"))
+        got_artists = [g for a in r.get("artists") or [] for g in split(a["name"])]
+        shared = any(similar(w, g) >= 0.85 for w in want_artists for g in got_artists)
+        if likeness < (0.75 if shared else 0.9):
+            continue
+        score = likeness * 4 + (3 if shared else 0)
+        # A remix or cover unless that's what this is
+        if variant_words(f"{r.get('title')} {(r.get('album') or {}).get('name', '')}") - variant_words(title):
+            score -= 4
+        length = r.get("duration_seconds") or 0
+        if seconds and length and abs(length - seconds) <= 5:
+            score += 1
+        if (r.get("album") or {}).get("id"):
+            score += 0.5
+        if score > best_score:
+            best, best_score, best_sure = r, score, shared
+    return (best, best_sure) if best_score > 0 else (None, False)
+
+
+def import_files(paths, apply):
+    api = yt()
+    music = music_dir()
+    albums = {}
+    unmatched = []
+    unsure = []
+    for path in paths:
+        artist, title, seconds = probe(path)
+        results = api.search(f"{artist} {title}", filter="songs", limit=10)
+        match, sure = best_match(results, artist, title, seconds)
+        if not match:
+            unmatched.append(path.name)
+            log(f"?  {path.name}: no match")
+            continue
+        album_id = (match.get("album") or {}).get("id") or ""
+        if album_id not in albums:
+            albums[album_id] = album_plan(album_id, api) if album_id else None
+        plan = albums[album_id]
+        track = (album_track(plan, match["videoId"], match["title"]) or [None])[0] if plan else None
+        if track is None:
+            # No album, or not on its list: a single
+            artists = match.get("artists") or []
+            album = {"id": "", "title": "", "artist": names(artists), "year": "", "kind": "Single",
+                     "folder_artist": artists[0]["name"] if artists else artist or "Unknown",
+                     "cover": cover_url(match.get("thumbnails"), COVER_SIZE)}
+            track = {"n": 1, "total": 1, "title": match["title"], "artist": names(artists), "videoId": match["videoId"]}
+        else:
+            album = plan["album"]
+        target = destination(music, album, track, path.suffix)
+        log(f"{'  ' if sure else '≈ '}{path.name}\n     {target.relative_to(music)}")
+        if not sure:
+            # Most often a cover by someone else: shown, but left alone
+            unsure.append(path.name)
+            continue
+        if apply:
+            place(path, album, track, cover_bytes(album), music, replace=False)
+    if apply:
+        subprocess.run(["mpc", "-q", "update", "--wait"], capture_output=True)
+    if unsure:
+        log(f"\n≈ Matched by title alone, no artist in common, so left where they are ({len(unsure)}): " + ", ".join(unsure))
+    if unmatched:
+        log(f"\nNot matched, left where they are ({len(unmatched)}): " + ", ".join(unmatched))
+    if not apply:
+        log("\nNothing changed; --apply tags and moves them.")
+
+
+_covers = {}
+
+
+def cover_bytes(album):
+    url = album.get("cover")
+    if not url:
+        return None
+    if url not in _covers:
+        result = subprocess.run(["curl", "-fsSL", "--max-time", "60", url], capture_output=True)
+        _covers[url] = result.stdout if result.returncode == 0 else None
+    return _covers[url]
+
+
+# --- the command line ------------------------------------------------------------------
+
+
+def main():
+    args = sys.argv[1:]
+    command = args.pop(0) if args else ""
+    if command == "search" and args[:1] == ["--json"] and len(args) > 1:
+        print(json.dumps(search(" ".join(args[1:]))))
+    elif command == "tracks" and args[:1] == ["--json"] and len(args) == 2:
+        print(json.dumps(album_plan(args[1])))
+    elif command == "get" and args:
+        # Run from the shell with nobody watching: a failure notifies
+        try:
+            if args[0] == "--song":
+                album_id = args[args.index("--album") + 1] if "--album" in args else ""
+                get(song_plan(args[1], album_id))
+            else:
+                numbers = {int(n) for n in args[args.index("--tracks") + 1].split(",")} if "--tracks" in args else None
+                get(album_plan(args[0]), numbers)
+        except (Exception, SystemExit) as exc:
+            if isinstance(exc, SystemExit) and not isinstance(exc.code, str):
+                raise
+            subprocess.run(["notify-send", "--app-name=Music", "--icon=dialog-error", "Couldn't download", str(exc)])
+            raise
+    elif command == "fetch" and len(args) == 1:
+        fetch(Path(args[0]))
+    elif command == "file" and len(args) == 1:
+        file(Path(args[0]))
+    elif command == "import":
+        apply = "--apply" in args
+        files = [Path(a) for a in args if a != "--apply"]
+        if not files:
+            files = sorted(p for p in music_dir().iterdir() if p.is_file() and p.suffix.lower() in AUDIO)
+        import_files(files, apply)
+    else:
+        print(__doc__.strip().split("\n\n")[1], file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
