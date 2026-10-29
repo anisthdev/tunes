@@ -215,7 +215,10 @@ def get(plan, numbers=None):
     if album["title"] and count < plan["tracks"][0]["total"]:
         title += f" ({count} of {plan['tracks'][0]['total']})"
     subprocess.run([
-        str(RUNNER), "start", "--kind", "music", "--title", title, "--subtitle", album["artist"],
+        # Shown in the bar as tunes' music; a click opens the music library
+        str(RUNNER), "start", "--app", "tunes", "--app-name", "Music", "--icon", "multimedia-audio-player",
+        "--open", "qs -p ~/Projects/quickbar ipc call musicmenu open",
+        "--title", title, "--subtitle", album["artist"],
         "--total", str(count), "--scratch", str(folder),
         "--done", f"{shlex.quote(me)} file {shlex.quote(str(folder))}",
         "--", me, "fetch", str(folder),
