@@ -1,0 +1,5 @@
+# makepkg
+/src/
+/pkg/
+/tunes/
+*.pkg.tar.zst

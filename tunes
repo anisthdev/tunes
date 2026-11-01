@@ -14,11 +14,16 @@
                                      Music and file them; without --apply, only
                                      says what it would do
 
-get hands the download to quickbar's runner (scripts/download), so the bar
-shows it: `tunes fetch DIR` downloads the tracks with yt-dlp into a staging
-folder, keeping YouTube's audio as it is, then `tunes file DIR` tags them,
-moves them to <music>/<Album artist>/<Album> (<Year>)/NN Title.ext with a
-cover.jpg, updates mpd and notifies, with Play and Open folder.
+get runs the download in the background: `tunes fetch DIR` downloads the
+tracks with yt-dlp into a staging folder, keeping YouTube's audio as it is,
+then `tunes file DIR` tags them, moves them to
+<music>/<Album artist>/<Album> (<Year>)/NN Title.ext with a cover.jpg,
+updates mpd and notifies, with Play and Open folder.
+
+With a download runner on PATH ($TUNES_RUNNER, else quickbar-download), the
+runner runs those two, so its downloads list can pause and cancel them.
+Without one, `tunes run DIR` does, showing progress as a notification with a
+value hint, which any notification daemon can draw.
 """
 
 import base64
@@ -38,7 +43,8 @@ sys.dont_write_bytecode = True
 HOME = Path.home()
 CACHE = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "tunes"
 STAGING = CACHE / "staging"
-RUNNER = Path(os.environ.get("QUICKBAR_DOWNLOAD", HOME / "Projects/quickbar/scripts/download"))
+# A runner taking `start --app … -- CMD`, as quickbar's (its docs/downloads.md)
+RUNNER = os.environ.get("TUNES_RUNNER", "quickbar-download")
 AUDIO = (".opus", ".m4a", ".webm", ".ogg", ".mp3", ".flac")
 COVER_SIZE = 1200
 
@@ -194,7 +200,7 @@ def song_plan(video_id, album_id="", api=None):
     }
 
 
-# --- get: hand a download to quickbar's runner -----------------------------------
+# --- get: download in the background ---------------------------------------------
 
 
 def get(plan, numbers=None):
@@ -214,15 +220,64 @@ def get(plan, numbers=None):
     title = album["title"] or plan["tracks"][0]["title"]
     if album["title"] and count < plan["tracks"][0]["total"]:
         title += f" ({count} of {plan['tracks'][0]['total']})"
-    subprocess.run([
-        # Shown in the bar as tunes' music; a click opens the music library
-        str(RUNNER), "start", "--app", "tunes", "--app-name", "Music", "--icon", "multimedia-audio-player",
-        "--open", "qs -p ~/Projects/quickbar ipc call musicmenu open",
-        "--title", title, "--subtitle", album["artist"],
-        "--total", str(count), "--scratch", str(folder),
-        "--done", f"{shlex.quote(me)} file {shlex.quote(str(folder))}",
-        "--", me, "fetch", str(folder),
-    ], check=True, stdout=subprocess.DEVNULL)
+    (folder / "title").write_text(title)
+    runner = shutil.which(RUNNER)
+    if runner:
+        subprocess.run([
+            runner, "start", "--app", "tunes", "--app-name", "Music", "--icon", "multimedia-audio-player",
+            "--title", title, "--subtitle", album["artist"],
+            "--total", str(count), "--scratch", str(folder),
+            "--done", f"{shlex.quote(me)} file {shlex.quote(str(folder))}",
+            "--", me, "fetch", str(folder),
+        ], check=True, stdout=subprocess.DEVNULL)
+    else:
+        subprocess.Popen([me, "run", str(folder)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def run(folder):
+    """fetch then file, without a runner: progress as one notification, its
+    value hint the share done, replaced by the result at the end."""
+    title = (folder / "title").read_text() if (folder / "title").exists() else folder.name
+    notice = Progress(title)
+    proc = subprocess.Popen([os.path.realpath(__file__), "fetch", str(folder)], stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, errors="replace")
+    index, total, error = 1, 1, ""
+    for line in proc.stdout:
+        if m := re.match(r"@item (\d+)/(\d+)", line):
+            index, total = int(m[1]), int(m[2])
+            notice.show((index - 1) / total, f"{index} of {total}")
+        elif m := re.search(r"@progress\s+([\d.]+)%", line):
+            notice.show((index - 1 + float(m[1]) / 100) / total, f"{index} of {total}")
+        elif line.startswith("@error "):
+            error = line[7:].strip()
+    if proc.wait() != 0:
+        notice.fail(error or "The download stopped")
+        sys.exit(1)
+    os.environ["TUNES_NOTIFY_ID"] = notice.id
+    file(folder)
+
+
+class Progress:
+    """A notification with a progress value, updated at most once a second."""
+
+    def __init__(self, title):
+        self.title, self.id, self.last = title, "", 0.0
+
+    def send(self, *args):
+        replace = ["--replace-id", self.id] if self.id else []
+        out = subprocess.run(["notify-send", "--print-id", "--app-name=Music", "--icon=multimedia-audio-player",
+                              *replace, *args], capture_output=True, text=True).stdout.strip()
+        self.id = out or self.id
+
+    def show(self, share, detail):
+        if time.monotonic() - self.last < 1 and self.id:
+            return
+        self.last = time.monotonic()
+        self.send("--hint", f"int:value:{min(100, int(share * 100))}", f"Downloading {self.title}", detail)
+
+    def fail(self, error):
+        self.send("--icon=dialog-error", f"Couldn't download {self.title}", error)
 
 
 def fetch(folder):
@@ -395,16 +450,18 @@ def notify_added(summary, body, files, folder):
     notify-send waits for the pick, so it runs on its own; this carries on and
     exits meanwhile, which finishes the download in the bar.
     """
+    # Replacing `run`'s progress notification, when there was one
+    replace = os.environ.get("TUNES_NOTIFY_ID", "")
     script = """
-        summary=$1 body=$2 folder=$3; shift 3
-        case "$(notify-send --app-name=Music --icon=audio-x-generic \
+        summary=$1 body=$2 folder=$3 replace=$4; shift 4
+        case "$(notify-send --app-name=Music --icon=audio-x-generic ${replace:+--replace-id=$replace} \
             --action=play=Play --action=open='Open folder' "$summary" "$body")" in
         play) mpc -q clear && mpc -q add "$@" && mpc -q play ;;
         open) exec uwsm app -- ghostty --title=yazi -e yazi "$folder" ;;
         esac
     """
     subprocess.Popen(
-        ["sh", "-c", script, "sh", summary, body, str(folder), *files],
+        ["sh", "-c", script, "sh", summary, body, str(folder), replace, *files],
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
@@ -587,6 +644,8 @@ def main():
         fetch(Path(args[0]))
     elif command == "file" and len(args) == 1:
         file(Path(args[0]))
+    elif command == "run" and len(args) == 1:
+        run(Path(args[0]))
     elif command == "import":
         apply = "--apply" in args
         files = [Path(a) for a in args if a != "--apply"]

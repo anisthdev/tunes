@@ -5,9 +5,10 @@ the music side of what [reel](../reel) is for video.
 
 - `tunes search` finds albums and songs; quickbar's media search
   (Entertainment → Music) shows them.
-- `tunes get` downloads an album, some of its tracks, or one song. It hands
-  the download to quickbar's runner (`~/Projects/quickbar/scripts/download`,
-  or `$QUICKBAR_DOWNLOAD`), so the bar shows its progress:
+- `tunes get` downloads an album, some of its tracks, or one song, in the
+  background. With a download runner on PATH (`$TUNES_RUNNER`, else
+  quickbar's `quickbar-download`) the runner runs it, so its downloads list
+  can pause and cancel it; without one, progress is a notification.
   `tunes fetch` runs yt-dlp into a staging folder in `~/.cache/tunes/`,
   keeping YouTube's audio as it is (opus or m4a), then `tunes file` tags it
   and moves it into mpd's `music_directory`, updates mpd, and notifies with
@@ -16,7 +17,8 @@ the music side of what [reel](../reel) is for video.
   same way (a dry run without `--apply`).
 
 It's a `uv run --script` script; ytmusicapi and mutagen are its
-dependencies, yt-dlp, curl and mpc its tools.
+dependencies, yt-dlp, curl, mpc and notify-send its tools. `makepkg -si`
+with the PKGBUILD installs it as `tunes`.
 
 ## Layout
 
@@ -31,9 +33,9 @@ the cover, and `YTMUSIC_VIDEO_ID`.
 ## Use
 
 ```sh
-./tunes search --json QUERY
-./tunes tracks --json ALBUM_ID
-./tunes get ALBUM_ID [--tracks 1,3]
-./tunes get --song VIDEO_ID [--album ALBUM_ID]
-./tunes import [--apply] [FILE...]
+tunes search --json QUERY
+tunes tracks --json ALBUM_ID
+tunes get ALBUM_ID [--tracks 1,3]
+tunes get --song VIDEO_ID [--album ALBUM_ID]
+tunes import [--apply] [FILE...]
 ```
