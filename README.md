@@ -11,8 +11,12 @@ the music side of what [reel](../reel) is for video.
   can pause and cancel it; without one, progress is a notification.
   `tunes fetch` runs yt-dlp into a staging folder in `~/.cache/tunes/`,
   keeping YouTube's audio as it is (opus or m4a), then `tunes file` tags it
-  and moves it into mpd's `music_directory`, updates mpd, and notifies with
-  Play and Open folder.
+  and moves it into mpd's `music_directory`, finds its lyrics, updates mpd,
+  and notifies with Play and Open folder.
+- `tunes lyrics` finds lyrics, from [LRCLIB](https://lrclib.net) and then
+  YouTube Music, for the library's songs without any, saved beside each song:
+  `Title.lrc` timed (only lyrics that fit the file, as those of another cut
+  would drift), else `Title.txt` plain.
 - `tunes import` tags loose files from YouTube Music and files them the
   same way (a dry run without `--apply`).
 
