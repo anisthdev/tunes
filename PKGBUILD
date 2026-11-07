@@ -17,16 +17,17 @@ optdepends=(
     'yazi: Open folder from the done notification'
 )
 makedepends=('git')
-source=("git+$url.git")
+# Not "tunes": the script of that name sits beside this file
+source=("$_name-src::git+$url.git")
 sha256sums=('SKIP')
 
 pkgver() {
-    cd "$_name"
+    cd "$_name-src"
     printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
 }
 
 package() {
-    cd "$_name"
+    cd "$_name-src"
     install -Dm755 tunes "$pkgdir/usr/bin/tunes"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$_name/README.md"
 }
