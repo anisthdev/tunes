@@ -30,6 +30,9 @@ with the PKGBUILD installs it as `tunes`.
 Tags: title, artist, album, album artist, date, track number and total,
 the cover, and `YTMUSIC_VIDEO_ID`.
 
+An album often lists a track under its music video, usually a different cut
+of the song, so tracks are taken from the album's audio playlist instead.
+
 ## Use
 
 ```sh

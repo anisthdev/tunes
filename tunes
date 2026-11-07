@@ -47,6 +47,8 @@ STAGING = CACHE / "staging"
 RUNNER = os.environ.get("TUNES_RUNNER", "quickbar-download")
 AUDIO = (".opus", ".m4a", ".webm", ".ogg", ".mp3", ".flac")
 COVER_SIZE = 1200
+# YouTube Music's type for an album's own recording, not a video of it
+AUDIO_TRACK = "MUSIC_VIDEO_TYPE_ATV"
 
 
 def log(message):
@@ -133,12 +135,39 @@ def search(query):
     return results
 
 
+def album_audio(album, tracks, api):
+    """{track's index: audio id} for the tracks an album lists under their
+    music video, a different cut from the album's: its audio playlist has the
+    recording itself. By index, as two tracks can list the same video. Empty
+    when that can't be read, and a track it lacks stays as listed."""
+    videos = [i for i, t in enumerate(tracks) if t.get("videoId") and t.get("videoType") != AUDIO_TRACK]
+    if not videos or not album.get("audioPlaylistId"):
+        return {}
+    try:
+        audio = api.get_playlist(album["audioPlaylistId"], limit=None).get("tracks") or []
+    except Exception:
+        return {}
+    found = {}
+    for i in videos:
+        title = normalize(tracks[i].get("title") or "")
+        same = [a for a in audio if normalize(a.get("title") or "") == title]
+        # In the album's order, as titles can repeat
+        if len(audio) == len(tracks) and audio[i] in same:
+            same = [audio[i]]
+        elif not title:
+            continue  # nothing to go on: normalize keeps only Latin letters
+        if same and same[0].get("videoId") and same[0].get("videoType") == AUDIO_TRACK:
+            found[i] = same[0]["videoId"]
+    return found
+
+
 def album_plan(album_id, api=None):
     """An album as get downloads it: its details and every track."""
     api = api or yt()
     a = api.get_album(album_id)
     artists = a.get("artists") or []
     tracks = a.get("tracks") or []
+    audio = album_audio(a, tracks, api)
     return {
         "album": {
             "id": album_id,
@@ -156,7 +185,8 @@ def album_plan(album_id, api=None):
                 "total": len(tracks),
                 "title": t.get("title") or "Untitled",
                 "artist": names(t.get("artists")) or names(artists),
-                "videoId": t.get("videoId"),
+                "videoId": audio.get(i, t.get("videoId")),
+                "listedId": t.get("videoId"),
                 "duration": t.get("duration") or "",
                 "seconds": t.get("duration_seconds") or 0,
                 "available": bool(t.get("videoId")) and t.get("isAvailable", True),
@@ -170,7 +200,7 @@ def album_track(plan, video_id, title):
     """The album's track that is this song, as a list of it or nothing. The
     album often lists the song under another video, so by title failing that."""
     for t in plan["tracks"]:
-        if t["videoId"] == video_id:
+        if video_id in (t["videoId"], t.get("listedId")):
             return [t]
     same = [t for t in plan["tracks"] if normalize(t["title"]) == normalize(title)]
     return same[:1]
